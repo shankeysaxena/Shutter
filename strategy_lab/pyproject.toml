@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strategy_lab"
+version = "0.1.0"
+description = "Validation-first intraday strategy lab"
+# Runtime and dev dependencies live in requirements.txt / requirements-dev.txt
+# to keep a single source of truth for both packaging and bare pip workflows.
+# Install: python3 -m pip install -r requirements-dev.txt
+dynamic = ["dependencies", "optional-dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+optional-dependencies.dev = { file = ["requirements-dev.txt"] }
+
+[tool.pytest.ini_options]
+# Slow tests (end-to-end ExperimentRunner runs with generated data) are skipped
+# by default. Run them explicitly with: pytest -m slow
+# Run everything: pytest -m ""
+addopts = "-m 'not slow'"
+markers = [
+    "slow: marks tests as slow / end-to-end (deselected by default; opt-in with -m slow)",
+]

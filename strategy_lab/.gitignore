@@ -1,0 +1,19 @@
+# Zerodha auth tokens and secrets — never commit
+.kite_token.json
+.env
+.env.local
+
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+__MACOSX/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+reports/
+logs/
+
+# Cached instrument dumps
+data/instruments/*.csv

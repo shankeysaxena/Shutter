@@ -1,0 +1,4 @@
+# Development / test dependencies. Pulls in runtime deps too.
+# Install: python3 -m pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=7.0.0

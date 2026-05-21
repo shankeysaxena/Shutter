@@ -1,0 +1,86 @@
+# Stage A — Live Paper Safety Config
+#
+# Purpose:  Validate execution infrastructure only.
+#           Not a strategy research run.
+#
+# Rules:
+#   - NIFTY only (single instrument, no cross-instrument state)
+#   - VWAP_PULLBACK only (only confirmed edge, use --policy vwap_pullback_only)
+#   - 1 trade per session (reduces concurrency, makes debugging unambiguous)
+#   - Daily cap ₹2,500 (≈ 1R on 1 lot — limits damage from any plumbing bug)
+#   - PaperExecutor (no real orders)
+#
+# Run:
+#   python -m src.cli.main zerodha login
+#   python -m src.cli.main live-paper start \
+#       --config config/live_paper_stage_a.yaml \
+#       --policy vwap_pullback_only
+#
+# Promote to Stage B only after:
+#   - 5 clean sessions (0 crashes, 0 orphan trades, 0 stale state)
+#   - At least 1 full trade lifecycle observed (entry + exit)
+#   - Session reset confirmed clean on day 2
+
+experiment_name: live_paper_stage_a
+
+live:
+  max_stale_minutes: 10   # force EOD flush if no bars for 10 min during market hours
+
+runtime:
+  mode: live_paper
+
+instruments:
+  - NIFTY
+
+costs:
+  slippage_per_side: 2.0
+  brokerage_per_trade: 20.0
+
+risk:
+  mode: fixed_lot
+  lot_size:
+    NIFTY: 25
+  max_total_trades_per_day: 1   # matches max_trades_per_session below
+
+risk_engine:
+  daily_loss_cap: -2500
+  per_strategy_loss_cap: -2500
+  max_open_positions: 1
+  max_trades_per_session: 1
+  cooldown_after_losses: 3
+  cooldown_minutes: 30
+  strategy_kill_switch:
+    consecutive_losses: 10
+
+session_validation:
+  enabled: false
+  policy: warn
+
+strategies:
+  vwap_pullback:
+    enabled: true
+    no_entry_after: "13:30"
+    max_trades_per_day: 1
+    target_r: 2.0
+    min_trend_bars: 3
+    pullback_zone_pct: 0.003
+
+  # All other strategies disabled for Stage A
+  orb:
+    enabled: false
+  gap_behavior:
+    enabled: false
+  vwap_reversion:
+    enabled: false
+  or_failure_fade:
+    enabled: false
+  iron_fly:
+    enabled: false
+
+option_chain_feed:
+  type: synthetic
+  synthetic:
+    atm_iv: 0.15
+
+multi_leg_simulator:
+  mode: realistic

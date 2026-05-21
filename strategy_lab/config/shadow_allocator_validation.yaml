@@ -1,0 +1,97 @@
+# Shadow Allocator Validation Config
+#
+# Purpose:  Enable all strategies so shadow portfolios are analytically meaningful.
+#           Used only for OBSERVATION — no orders placed from this config.
+#
+# This config is passed via --shadow-config. The primary execution config
+# remains config/live_paper_stage_a.yaml (strict, 1 trade/day).
+#
+# Run alongside Stage A:
+#   python -m src.cli.main live-paper start \
+#       --config config/live_paper_stage_a.yaml \
+#       --policy vwap_pullback_only \
+#       --shadow-config config/shadow_allocator_validation.yaml \
+#       --shadow deterministic_no_orb all_on
+
+experiment_name: shadow_allocator_validation
+
+runtime:
+  mode: live_paper
+
+instruments:
+  - NIFTY
+
+costs:
+  slippage_per_side: 2.0
+  brokerage_per_trade: 20.0
+
+risk:
+  mode: fixed_lot
+  lot_size:
+    NIFTY: 25
+  max_total_trades_per_day: 20   # shadows can generate many signals for comparison
+
+risk_engine:
+  daily_loss_cap: -99999         # no halt in shadow mode (observation only)
+  per_strategy_loss_cap: -99999
+  max_open_positions: 10
+  max_trades_per_session: 20
+  cooldown_after_losses: 3
+  cooldown_minutes: 30
+  strategy_kill_switch:
+    consecutive_losses: 50       # effectively disabled in shadow
+
+session_validation:
+  enabled: false
+  policy: warn
+
+# All strategies enabled so each policy gets a real population of signals
+strategies:
+  vwap_pullback:
+    enabled: true
+    no_entry_after: "13:30"
+    max_trades_per_day: 4
+    target_r: 2.0
+    min_trend_bars: 3
+    pullback_zone_pct: 0.003
+
+  vwap_reversion:
+    enabled: true
+    stretch_threshold_atr: 1.5
+    min_bars_stretched: 2
+    min_reversal_ratio: 0.25
+    max_stretch_bars: 30
+    no_entry_after: "13:30"
+    max_trades_per_day: 2
+    stop_mode: hybrid_atr
+    atr_stop_multiplier: 0.75
+    stop_buffer_pct: 0.0008
+
+  or_failure_fade:
+    enabled: true
+    max_failure_bars: 5
+    stop_buffer_pct: 0.0003
+    target_type: vwap
+    no_entry_after: "13:30"
+    max_trades_per_day: 2
+    stop_mode: hybrid_atr
+    atr_stop_multiplier: 0.75
+    min_gap_pct: 0.000
+    min_or_width_pct: 0.000
+
+  orb:
+    enabled: true                # included for all_on benchmark
+    opening_range_start: "09:15"
+    opening_range_end: "09:30"
+    no_entry_after: "12:00"
+    target_r: 2.0
+
+  gap_behavior:
+    enabled: true                # included for all_on benchmark only
+    gap_threshold_pct: 0.005
+    opening_range_end: "09:30"
+    no_entry_after: "12:30"
+    target_r: 2.0
+
+  iron_fly:
+    enabled: false               # not validated yet

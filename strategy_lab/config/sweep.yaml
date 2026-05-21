@@ -1,0 +1,34 @@
+# Phase 4.7 validation sweep config
+# Run with: python validate.py config/sweep.yaml data/raw runs
+
+base_config: config/base.yaml
+
+# 4.7A — Multi-year validation
+# Add one entry per year once you have the data.
+# All other strategy and cost params come from base_config.
+date_ranges:
+  - label: "2024"
+    start: "2024-01-01"
+    end:   "2024-12-31"
+  - label: "2023"
+    start: "2023-01-01"
+    end:   "2023-12-31"
+  - label: "2022"
+    start: "2022-01-01"
+    end:   "2022-12-31"
+
+# 4.7B — Parameter sensitivity
+# Vary each param independently. Keep everything else fixed.
+param_sweeps:
+  - param: strategies.vwap_pullback.pullback_zone_pct
+    values: [0.001, 0.002, 0.003, 0.004, 0.005]
+
+  - param: strategies.gap_behavior.gap_threshold_pct
+    values: [0.003, 0.005, 0.007, 0.010]
+
+  - param: costs.slippage_per_side
+    values: [1.0, 2.0, 3.0, 5.0]
+
+# 4.7C — Backtest vs replay consistency check
+# Runs both runtimes on the same data and saves comparison artifact.
+compare_runtimes: true

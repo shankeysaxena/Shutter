@@ -1,0 +1,30 @@
+# IDE / Claude Code local settings
+.claude/
+
+# Secrets — never commit
+.env
+.env.local
+.kite_token.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Test / cache
+.pytest_cache/
+
+# Runtime output
+reports/
+logs/
+runs/
+
+# Cached instrument dumps
+data/instruments/*.csv

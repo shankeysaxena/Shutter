@@ -1,0 +1,8 @@
+# Runtime dependencies for strategy_lab.
+# Install: python3 -m pip install -r requirements.txt
+pandas>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0.0
+pyarrow>=10.0.0          # Phase 4.8 — historical option-chain Parquet storage
+kiteconnect>=5.0.0       # Phase 4.8A — Zerodha Kite Connect historical data ingestion
+pyotp>=2.9.0             # automated Kite TOTP login (no-browser daily refresh)
