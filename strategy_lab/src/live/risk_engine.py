@@ -36,6 +36,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from src.core.models import Signal
+from src.core.option_models import MultiLegSignal
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,11 @@ class RiskState:
     open_positions:   int   = 0   # currently open trade count
     halted:           bool  = False
     halt_reason:      str   = ''
+
+    # Option-specific counters (Phase 3)
+    open_option_positions: int   = 0
+    option_trades_today:   int   = 0
+    option_session_pnl:    float = 0.0
 
     # Per-strategy trackers
     strategy_pnl:          Dict[str, float]    = field(default_factory=dict)
@@ -86,6 +92,11 @@ class RiskEngine:
         # Hard kill: strategy permanently disabled if consecutive losses hit this
         ks = rc.get('strategy_kill_switch', {})
         self.kill_after_losses     = ks.get('consecutive_losses', 10)
+
+        # Phase 3 — option-specific limits
+        self.max_open_option_positions    = rc.get('max_open_option_positions', 1)
+        self.max_option_trades_per_session= rc.get('max_option_trades_per_session', 2)
+        self.max_daily_option_loss        = rc.get('max_daily_option_loss', -3_000)
 
     # ----------------------------------------------------------------
     # Public interface — called by LivePaperRuntime
@@ -222,6 +233,55 @@ class RiskEngine:
             state.halted      = True
             state.halt_reason = reason
             logger.warning(f"SESSION HALTED: {reason}")
+
+    # ----------------------------------------------------------------
+    # Phase 3 — Options risk checks
+    # ----------------------------------------------------------------
+
+    def approve_multi_leg_signal(
+        self,
+        signal: MultiLegSignal,
+        state:  RiskState,
+        now:    Optional[datetime] = None,
+        options_cfg: Optional[dict] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Approve or reject a multi-leg (options) signal.
+        Called by LivePaperRuntime before filling a queued MultiLegSignal.
+        """
+        now = now or datetime.now()
+        if state.halted:
+            return False, f'session_halted:{state.halt_reason}'
+
+        if state.open_option_positions >= self.max_open_option_positions:
+            return False, f'max_option_positions:{self.max_open_option_positions}'
+
+        if state.option_trades_today >= self.max_option_trades_per_session:
+            return False, f'max_option_trades:{self.max_option_trades_per_session}'
+
+        if state.option_session_pnl <= self.max_daily_option_loss:
+            return False, f'daily_option_loss_cap:{state.option_session_pnl:.0f}'
+
+        # No new entry after cutoff
+        if options_cfg:
+            long_cfg = options_cfg.get('long_option', {})
+            cutoff_str = long_cfg.get('no_new_entry_after', '14:30')
+            h, m = map(int, cutoff_str.split(':'))
+            from datetime import time as _time
+            if now.time() >= _time(h, m):
+                return False, f'no_new_entry_after:{cutoff_str}'
+
+        return True, 'approved'
+
+    def record_multi_leg_open(self, state: RiskState) -> None:
+        state.open_option_positions += 1
+        state.option_trades_today   += 1
+
+    def record_multi_leg_close(self, state: RiskState, net_pnl: float) -> None:
+        state.open_option_positions = max(0, state.open_option_positions - 1)
+        state.option_session_pnl   += net_pnl
+        logger.info(f"Option trade closed: net_pnl=₹{net_pnl:.2f}  "
+                    f"session_option_pnl=₹{state.option_session_pnl:.2f}")
 
     def reset_session(self) -> RiskState:
         """Create a fresh RiskState for a new session."""

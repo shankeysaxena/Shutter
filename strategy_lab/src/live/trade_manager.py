@@ -24,7 +24,9 @@ import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from datetime import time as _time
 from src.core.models import EngineState, Trade
+from src.core.option_models import MultiLegSignal, MultiLegTrade, ChainSnapshot
 from src.execution.executor import Executor, OrderRequest, OrderStatus
 from src.live.bar_builder import LiveBar
 from src.live.risk_engine import RiskEngine, RiskState
@@ -50,6 +52,9 @@ class LiveTradeManager:
 
         # Pending exit orders waiting for fill: {exit_order_id → trade}
         self._pending_exits: Dict[str, Trade] = {}
+
+        # Phase 3: option paper executor (set after init via set_option_executor)
+        self._option_executor = None
 
     # ----------------------------------------------------------------
     # Entry fill → Trade creation
@@ -328,3 +333,152 @@ class LiveTradeManager:
 
     def reset_session(self) -> None:
         self._pending_exits.clear()
+
+    def set_option_executor(self, option_executor) -> None:
+        self._option_executor = option_executor
+
+    # ----------------------------------------------------------------
+    # Phase 3 — Multi-leg (options) lifecycle
+    # ----------------------------------------------------------------
+
+    def on_multi_leg_entry(
+        self,
+        signal:      MultiLegSignal,
+        chain:       'ChainSnapshot',
+        state:       EngineState,
+        risk_state:  RiskState,
+        lots:        int = 1,
+        fill_time:   Optional[datetime] = None,
+    ) -> Optional[MultiLegTrade]:
+        """
+        Immediately fill a multi-leg signal and open the trade.
+        Returns None if the fill fails (unquotable leg or executor not set).
+        """
+        if self._option_executor is None:
+            logger.warning("on_multi_leg_entry: option executor not set — skipping")
+            return None
+
+        trade = self._option_executor.fill_signal(signal, chain, lots=lots, fill_time=fill_time)
+        if trade is None:
+            return None
+
+        state.open_multi_leg_trades.append(trade)
+        state.per_strategy_day_trade_count[signal.strategy_name] = (
+            state.per_strategy_day_trade_count.get(signal.strategy_name, 0) + 1
+        )
+        self.risk_engine.record_multi_leg_open(risk_state)
+
+        entry_prem = self._option_executor.entry_premium_per_lot(trade)
+        logger.info(
+            f"Option trade opened: {signal.strategy_name} {signal.structure_type} "
+            f"{signal.instrument}  entry_debit=₹{entry_prem:.2f}/lot  "
+            f"legs={[f'{l.option_type}{l.strike}' for l in signal.legs]}"
+        )
+        return trade
+
+    def check_premium_exits(
+        self,
+        bar:         LiveBar,
+        chain:       Optional['ChainSnapshot'],
+        state:       EngineState,
+        risk_state:  RiskState,
+        options_cfg: dict,
+    ) -> List[MultiLegTrade]:
+        """
+        Check every open multi-leg trade for premium stop / target / time exits.
+        Returns list of trades that were closed this bar.
+
+        Exit triggers (in priority order):
+          1. Force-flat time (force_flat_after) — always exits
+          2. Max hold time (max_hold_minutes) — exits regardless of P&L
+          3. Premium stop (premium_stop_pct) — exit if P&L < -entry × stop_pct
+          4. Premium target (premium_target_pct) — exit if P&L > +entry × target_pct
+        """
+        if self._option_executor is None or not state.open_multi_leg_trades:
+            return []
+
+        long_cfg    = options_cfg.get('long_option', {})
+        stop_pct    = long_cfg.get('premium_stop_pct', 0.30)
+        target_pct  = long_cfg.get('premium_target_pct', 0.50)
+        max_hold    = long_cfg.get('max_hold_minutes', 60)
+        force_after = long_cfg.get('force_flat_after', '15:10')
+        fh, fm      = map(int, force_after.split(':'))
+        force_time  = _time(fh, fm)
+
+        closed = []
+        still_open = []
+
+        for trade in state.open_multi_leg_trades:
+            if trade.instrument != bar.instrument:
+                still_open.append(trade)
+                continue
+
+            # Force flat
+            if bar.timestamp.time() >= force_time:
+                reason = 'FORCE_FLAT'
+            else:
+                # Max hold time
+                hold_mins = (bar.timestamp - trade.entry_time).total_seconds() / 60
+                if hold_mins >= max_hold:
+                    reason = 'MAX_HOLD_TIME'
+                elif chain is None:
+                    still_open.append(trade)
+                    continue
+                else:
+                    mtm = self._option_executor.mark_to_market(trade, chain)
+                    if mtm is None:
+                        still_open.append(trade)   # chain too stale — skip
+                        continue
+
+                    entry_prem = self._option_executor.entry_premium_per_lot(trade)
+                    if mtm <= -entry_prem * stop_pct:
+                        reason = 'PREMIUM_STOP'
+                    elif mtm >= entry_prem * target_pct:
+                        reason = 'PREMIUM_TARGET'
+                    else:
+                        still_open.append(trade)
+                        continue
+
+            # Close the trade
+            close_chain = chain if chain is not None else self._last_chain
+            if close_chain is None:
+                logger.warning(f"Cannot close {trade.trade_id[:8]}: no chain available")
+                still_open.append(trade)
+                continue
+
+            ok = self._option_executor.close_trade(trade, close_chain, reason, bar.timestamp)
+            if ok:
+                state.closed_multi_leg_trades.append(trade)
+                self.risk_engine.record_multi_leg_close(risk_state, trade.net_pnl or 0.0)
+                closed.append(trade)
+                logger.info(
+                    f"Option trade closed: {trade.strategy_name} {reason} "
+                    f"net_pnl=₹{trade.net_pnl or 0:.2f}"
+                )
+            else:
+                still_open.append(trade)   # close failed; try again next bar
+
+        state.open_multi_leg_trades = still_open
+        return closed
+
+    def flush_multi_leg_session(
+        self,
+        last_bar:    LiveBar,
+        chain:       Optional['ChainSnapshot'],
+        state:       EngineState,
+        risk_state:  RiskState,
+    ) -> None:
+        """Force-close all open multi-leg trades at EOD."""
+        if self._option_executor is None:
+            return
+        for trade in list(state.open_multi_leg_trades):
+            if trade.instrument != last_bar.instrument:
+                continue
+            if chain is not None:
+                ok = self._option_executor.close_trade(trade, chain, 'EOD', last_bar.timestamp)
+                if ok:
+                    state.closed_multi_leg_trades.append(trade)
+                    self.risk_engine.record_multi_leg_close(risk_state, trade.net_pnl or 0.0)
+        state.open_multi_leg_trades = [
+            t for t in state.open_multi_leg_trades if t.instrument != last_bar.instrument
+        ]

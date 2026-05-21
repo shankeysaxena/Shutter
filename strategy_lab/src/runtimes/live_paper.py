@@ -45,6 +45,7 @@ import pandas as pd
 
 from src.core.engine import BarEngine
 from src.core.models import EngineState, Signal
+from src.core.option_models import MultiLegSignal
 from src.core.utils import row_to_bar_event
 from src.execution.executor import Executor, OrderRequest
 from src.execution.paper_executor import PaperExecutor
@@ -88,6 +89,7 @@ class LivePaperRuntime:
         monitor:           Optional[SessionHealthMonitor] = None,
         shadow_evaluators: Optional[List[ShadowEvaluator]] = None,
         notifier:          Optional[NotificationService]   = None,
+        option_chain_feed  = None,   # Phase 3: OptionChainFeed for signal generation + exit MTM
     ):
         self.strategies  = strategies
         self.executor    = executor
@@ -132,14 +134,27 @@ class LivePaperRuntime:
             IntradayATRFeature(period=14),
         ]
 
-        # BarEngine uses SignalOnlySimulator — it NEVER creates trades or closes
-        # exits. Signal generation (step 3) is all we need from BarEngine.
-        # Trade lifecycle (entry fill, exit detection, P&L) is owned exclusively
-        # by LiveTradeManager + Executor so risk accounting stays consistent.
+        # Phase 3 — option chain feed + executor
+        self._option_chain_feed = option_chain_feed
+        if option_chain_feed is not None:
+            from src.execution.option_paper_executor import OptionPaperExecutor
+            from src.execution.multi_leg_simulator import MultiLegSimulator
+            ml_sim = MultiLegSimulator(
+                mode=config.get('multi_leg_simulator', {}).get('mode', 'realistic'),
+                brokerage_per_leg=brokerage,
+            )
+            self._option_executor = OptionPaperExecutor(ml_sim, lot_sizes)
+            self._trade_manager.set_option_executor(self._option_executor)
+        else:
+            self._option_executor = None
+
+        # BarEngine — pass chain feed so ctx.chain_snapshot is populated
+        # (OptionsConversionGate reads it to produce MultiLegSignals)
         self._engine = BarEngine(
             strategies=strategies,
             simulator=_SignalOnlySimulator(),
             config=config,
+            chain_feed=option_chain_feed,
         )
 
         self._running = False
@@ -214,6 +229,14 @@ class LivePaperRuntime:
         if bar.timestamp.time() >= _EOD_FLUSH_AT and not self._eod_flushed:
             self._eod_flushed = True
             self._trade_manager.flush_session(bar, state, self._risk_state, self._brokerage)
+            # Phase 3: also flush open option trades
+            if self._option_executor is not None:
+                chain_eod = None
+                if self._option_chain_feed is not None:
+                    chain_eod = self._option_chain_feed.snapshot_at(bar.timestamp, inst, bar.close)
+                self._trade_manager.flush_multi_leg_session(
+                    bar, chain_eod, state, self._risk_state
+                )
 
 
         # Accumulate bar row and recompute features
@@ -252,10 +275,23 @@ class LivePaperRuntime:
         for shadow in self.shadow_evaluators:
             shadow.process_bar(bar_event, bar.instrument)
 
-        # Check exits for open trades BEFORE generating new signals
+        # Phase 3: get chain snapshot for option exit checks and signal conversion
+        chain = None
+        if self._option_chain_feed is not None:
+            chain = self._option_chain_feed.snapshot_at(bar.timestamp, inst, bar.close)
+
+        # Check exits for open single-leg trades BEFORE generating new signals
         self._trade_manager.check_exits(bar, state, self._risk_state, self._brokerage)
 
-        # Generate signals via engine (allocator + strategy logic)
+        # Phase 3: check option exit triggers (premium stop/target/time)
+        if self._option_executor is not None:
+            closed_ml = self._trade_manager.check_premium_exits(
+                bar, chain, state, self._risk_state, self.config
+            )
+            for ml_trade in closed_ml:
+                self._notify_option_exit(ml_trade)
+
+        # Generate signals via engine (allocator + strategy logic, chain injected)
         self._engine.process_bar(bar_event, state, inst)
 
         # Check if session was halted mid-bar and notify once
@@ -265,10 +301,14 @@ class LivePaperRuntime:
                 f"🛑 *SESSION HALTED*\n{self._risk_state.halt_reason}", CRITICAL
             )
 
-        # Submit any new signals that cleared the risk engine
+        # Phase 3: fill queued multi-leg signals (option trades)
+        if self._option_executor is not None and chain is not None:
+            self._submit_pending_multi_leg_signals(state, chain, bar.timestamp)
+
+        # Submit any new single-leg signals that cleared the risk engine
         self._submit_pending_signals(bar_event)
 
-        # Poll executor fills → close trades (FIX #3: no state arg)
+        # Poll executor fills → close single-leg trades
         self._process_fills()
 
     # ----------------------------------------------------------------
@@ -414,6 +454,63 @@ class LivePaperRuntime:
                 )
 
     # ----------------------------------------------------------------
+    # Phase 3 — Multi-leg signal submission and notifications
+    # ----------------------------------------------------------------
+
+    def _submit_pending_multi_leg_signals(
+        self, state: EngineState, chain, bar_ts: datetime
+    ) -> None:
+        """Fill queued MultiLegSignals as option paper trades."""
+        if not state.queued_multi_leg_signals:
+            return
+
+        to_fill = list(state.queued_multi_leg_signals)
+        state.queued_multi_leg_signals = []
+
+        for signal in to_fill:
+            approved, reason = self.risk_engine.approve_multi_leg_signal(
+                signal, self._risk_state, now=bar_ts, options_cfg=self.config
+            )
+            if not approved:
+                logger.info(f"Multi-leg signal rejected ({reason}): {signal.strategy_name}")
+                continue
+
+            trade = self._trade_manager.on_multi_leg_entry(
+                signal, chain, state, self._risk_state,
+                lots=1, fill_time=bar_ts,
+            )
+            if trade is None:
+                continue
+
+            self._notify_option_entry(signal, trade)
+
+    def _notify_option_entry(self, signal: MultiLegSignal, trade: MultiLegTrade) -> None:
+        leg   = trade.entry_fills[0].leg if trade.entry_fills else None
+        prem  = abs(trade.net_entry_credit)
+        lot_s = self._option_executor.entry_premium_per_lot(trade) if self._option_executor else prem
+        if leg:
+            self.notifier.send(
+                f"📤 *Option Entry* `{signal.strategy_name}`\n"
+                f"`{leg.instrument}` {leg.option_type} {leg.strike:.0f}  "
+                f"Expiry: {leg.expiry}\n"
+                f"Premium: ₹{lot_s:.1f}/lot  Structure: {signal.structure_type}",
+                INFO,
+            )
+
+    def _notify_option_exit(self, trade: MultiLegTrade) -> None:
+        pnl    = trade.net_pnl or 0.0
+        reason = trade.exit_reason or 'EXIT'
+        level  = WARNING if pnl < 0 else INFO
+        icon   = '🔴' if pnl < 0 else '🟢'
+        leg    = trade.entry_fills[0].leg if trade.entry_fills else None
+        leg_s  = f"`{leg.option_type} {leg.strike:.0f}`" if leg else ''
+        self.notifier.send(
+            f"{icon} *Option Exit* `{trade.strategy_name}` {leg_s}\n"
+            f"Reason: `{reason}`  P&L: ₹{pnl:+,.0f}",
+            level,
+        )
+
+    # ----------------------------------------------------------------
     # Session reset
     # ----------------------------------------------------------------
 
@@ -438,6 +535,10 @@ class LivePaperRuntime:
                 session_date=new_date,
                 open_trades=[], closed_trades=[], queued_signals=[],
                 per_strategy_day_trade_count={s.name: 0 for s in self.strategies},
+                # Phase 3: multi-leg ledger cleared each session
+                open_multi_leg_trades=[],
+                closed_multi_leg_trades=[],
+                queued_multi_leg_signals=[],
             )
             for inst in self.instruments
         }
@@ -553,8 +654,10 @@ class LivePaperRuntime:
         date = self._current_date or 'unknown'
 
         all_trades = []
+        all_ml_trades = []
         for st in self._engine_states.values():
             all_trades.extend(st.closed_trades)
+            all_ml_trades.extend(st.closed_multi_leg_trades)
 
         n       = len(all_trades)
         pnl     = sum(t.net_pnl for t in all_trades if t.net_pnl)
@@ -568,13 +671,24 @@ class LivePaperRuntime:
             f"Status: {halted}\n"
             f"Entries accepted: {rs.entries_accepted}"
         )
+
+        # Phase 3: option summary
+        if all_ml_trades:
+            ml_pnl  = sum(t.net_pnl or 0 for t in all_ml_trades)
+            ml_wins = sum(1 for t in all_ml_trades if (t.net_pnl or 0) > 0)
+            ml_wr   = f"{ml_wins/len(all_ml_trades):.0%}"
+            msg += (
+                f"\n\n*Options* n={len(all_ml_trades)}  WR: {ml_wr}  "
+                f"P&L: ₹{ml_pnl:,.0f}"
+            )
+
         if rs.halted:
             msg += f"\nHalt reason: `{rs.halt_reason}`"
 
         self.notifier.send(msg, CRITICAL if rs.halted else INFO)
-        self._save_daily_report(date, all_trades, rs)
+        self._save_daily_report(date, all_trades, rs, all_ml_trades)
 
-    def _save_daily_report(self, session_date, trades, rs) -> None:
+    def _save_daily_report(self, session_date, trades, rs, ml_trades=None) -> None:
         """Save Stage B daily JSON report to runs/live_paper/<date>.json"""
         import json
         from collections import defaultdict
@@ -648,6 +762,32 @@ class LivePaperRuntime:
                 for t in trades
             ],
         }
+        # Phase 3: option trades section
+        if ml_trades:
+            report['option_trades'] = [
+                {
+                    'strategy':     t.strategy_name,
+                    'instrument':   t.instrument,
+                    'structure':    t.structure_type,
+                    'entry_time':   str(t.entry_time),
+                    'exit_time':    str(t.exit_time),
+                    'exit_reason':  t.exit_reason,
+                    'net_pnl':      t.net_pnl,
+                    'entry_fills':  [
+                        {'strike': f.leg.strike, 'option_type': f.leg.option_type,
+                         'side': f.leg.side, 'fill_price': f.fill_price,
+                         'expiry': str(f.leg.expiry)}
+                        for f in t.entry_fills
+                    ],
+                }
+                for t in ml_trades
+            ]
+            report['option_summary'] = {
+                'total':   len(ml_trades),
+                'net_pnl': round(sum(t.net_pnl or 0 for t in ml_trades), 2),
+                'wins':    sum(1 for t in ml_trades if (t.net_pnl or 0) > 0),
+            }
+
         path = out_dir / f"{session_date}.json"
         path.write_text(json.dumps(report, indent=2, default=str))
         logger.info(f"Daily report saved → {path}")
