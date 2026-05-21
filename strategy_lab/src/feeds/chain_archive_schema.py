@@ -14,11 +14,16 @@ Per-file Parquet schema (one row per quote, per timestamp):
     expiry        string ISO date  option expiry (YYYY-MM-DD)
     strike        float64
     option_type   string           'CE' | 'PE'
-    bid           float64
-    ask           float64
-    last          float64
+    bid           float64          best bid (real from WebSocket depth; proxy in historical fallback)
+    ask           float64          best ask
+    last          float64          last traded price
     iv            float64          implied vol as decimal (0.15 == 15%)
 
+Phase 2 optional columns (present when recorded via WebSocket real-time feed):
+    volume        int64            cumulative day volume at this bar
+    oi            int64            open interest at this bar
+
+Readers that don't need volume/OI can ignore these columns safely.
 A single file is expected to contain ~375 timestamps × ~80 strikes×2-types ≈ 30k rows.
 Files are sorted by (timestamp, strike, option_type) on write for efficient scan.
 """
@@ -27,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Required Parquet columns
+# Required Parquet columns (present in all archive files)
 REQUIRED_COLUMNS = [
     'timestamp',
     'spot',
@@ -39,6 +44,9 @@ REQUIRED_COLUMNS = [
     'last',
     'iv',
 ]
+
+# Optional Phase 2 columns — present when recorded via WebSocket real-time feed
+OPTIONAL_COLUMNS = ['volume', 'oi']
 
 # Manifest file name at the archive root
 META_FILENAME = '_meta.yaml'

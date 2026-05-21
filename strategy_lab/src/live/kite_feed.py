@@ -62,10 +62,31 @@ class KiteWebSocketFeed(MarketDataFeed):
         self._token_map:        Dict[int, str] = dict(_TOKEN_TO_SYMBOL)
         self._ticker           = None
         self._connected        = False
+        # Option tick routing — set by subscribe_options()
+        self._option_tokens:   set = set()
+        self._on_option_tick   = None   # callable(token, raw_tick_dict)
 
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    def subscribe_options(self, tokens: List[int], on_option_tick) -> None:
+        """
+        Subscribe to option instrument tokens in FULL mode.
+        `on_option_tick(token, raw_tick_dict)` is called for each incoming tick.
+        Must be called before start() to take effect; or call add_option_tokens()
+        after connection to dynamically extend the subscription.
+        """
+        self._option_tokens  = set(tokens)
+        self._on_option_tick = on_option_tick
+        # If already connected, extend the active subscription immediately
+        if self._ticker is not None and self._connected and tokens:
+            try:
+                self._ticker.subscribe(tokens)
+                self._ticker.set_mode(self._ticker.MODE_FULL, tokens)
+                logger.info(f"Subscribed {len(tokens)} option tokens on live feed")
+            except Exception as e:
+                logger.warning(f"Could not subscribe option tokens live: {e}")
 
     def subscribe(self, instruments: List[str]) -> None:
         """
@@ -142,6 +163,11 @@ class KiteWebSocketFeed(MarketDataFeed):
         if self._subscribed_tokens:
             ws.subscribe(self._subscribed_tokens)
             ws.set_mode(ws.MODE_FULL, self._subscribed_tokens)
+        if self._option_tokens:
+            opt_list = list(self._option_tokens)
+            ws.subscribe(opt_list)
+            ws.set_mode(ws.MODE_FULL, opt_list)
+            logger.info(f"Subscribed {len(opt_list)} option tokens in FULL mode")
         if self._on_connect:
             self._on_connect('connected', None)
 
@@ -158,14 +184,20 @@ class KiteWebSocketFeed(MarketDataFeed):
             self._on_disconnect('error', Exception(f"code={code} reason={reason}"))
 
     def _on_ticks(self, ws, ticks: list) -> None:
-        """Convert Kite tick dicts to Tick objects and route to callback."""
-        if self._on_tick is None:
-            return
-
+        """Convert Kite tick dicts to Tick objects and route to callbacks."""
         for raw in ticks:
             try:
-                token       = raw.get('instrument_token', 0)
-                symbol      = self._token_map.get(token)
+                token = raw.get('instrument_token', 0)
+
+                # Option tick — route raw dict to option recorder
+                if token in self._option_tokens and self._on_option_tick is not None:
+                    self._on_option_tick(token, raw)
+                    continue   # option tokens are not underlying index bars
+
+                # Underlying index tick — route to bar builder as before
+                if self._on_tick is None:
+                    continue
+                symbol = self._token_map.get(token)
                 if symbol is None:
                     continue
 
@@ -174,11 +206,11 @@ class KiteWebSocketFeed(MarketDataFeed):
                     ts = ts.replace(tzinfo=None)   # strip tz → naive IST
 
                 tick = Tick(
-                    instrument   = symbol,
-                    timestamp    = ts,
-                    last_price   = float(raw.get('last_price', 0)),
-                    last_quantity= int(raw.get('last_quantity', 0)),
-                    volume       = int(raw.get('volume', raw.get('volume_traded', 0))),
+                    instrument    = symbol,
+                    timestamp     = ts,
+                    last_price    = float(raw.get('last_price', 0)),
+                    last_quantity = int(raw.get('last_quantity', 0)),
+                    volume        = int(raw.get('volume', raw.get('volume_traded', 0))),
                 )
                 self._on_tick(tick)
             except Exception as e:

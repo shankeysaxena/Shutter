@@ -131,16 +131,25 @@ class OptionChainRecorder:
                     continue
                 candles = self._fetch_candles_with_retry(token, from_dt, to_dt)
                 for c in candles:
+                    ltp  = float(c.get('close', 0))
+                    high = float(c.get('high', ltp))
+                    low  = float(c.get('low', ltp))
+                    # Phase 2 improvement: use candle high/low as ask/bid bounds.
+                    # Historical API doesn't provide real L1 quotes; WebSocket FULL
+                    # mode (option_tick_recorder.py) is needed for true bid/ask.
+                    # high >= last >= low always holds, so this is a valid bound.
                     rows.append({
                         'timestamp':   _strip_tz(c.get('date')),
-                        'spot':        None,    # filled in from underlying bars below
+                        'spot':        None,       # merged with underlying bars after fetch
                         'expiry':      expiry.isoformat(),
                         'strike':      strike,
                         'option_type': opt_type,
-                        'bid':         float(c.get('open', 0)),   # best available; Kite doesn't give L1 quotes in historical
-                        'ask':         float(c.get('close', 0)),  # open as proxy for bid, close for ask
-                        'last':        float(c.get('close', 0)),
-                        'iv':          0.0,   # populated in Phase IF-2 via BSM back-calculation
+                        'bid':         low,
+                        'ask':         high,
+                        'last':        ltp,
+                        'volume':      int(c.get('volume', 0)),
+                        'oi':          int(c.get('oi', 0)),
+                        'iv':          0.0,        # BSM IV computed in post-processing
                     })
                 time.sleep(self._config.request_sleep_sec)
 
@@ -177,7 +186,7 @@ class OptionChainRecorder:
                 return self._kite.historical_data(
                     instrument_token=token,
                     from_date=from_dt, to_date=to_dt,
-                    interval='minute', continuous=False, oi=False,
+                    interval='minute', continuous=False, oi=True,
                 )
             except Exception as e:
                 if attempt < self._config.max_retries:
