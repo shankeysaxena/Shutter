@@ -1,0 +1,127 @@
+# Options Live-Paper — Stage A (Phase 1: Long Option Buying)
+#
+# Strategy: translate VWAP_PULLBACK / VWAP_REVERSION signals into
+# NIFTY ATM/ITM CE or PE paper trades. No spreads, no Iron Fly.
+#
+# Acceptance gates before moving to real capital (from implementation guide §18):
+#   Gate A: chain recorded for ≥20 sessions, missing rate <2%
+#   Gate B: no crashes 10 consecutive sessions, P&L reconciles
+#   Gate C: ≥20 paper trades, drawdown within budget
+#   Gate D: kill switch, broker failure, missing chain all tested
+
+experiment_name: live_paper_options_stage_a
+
+runtime:
+  mode: live_paper
+
+instruments:
+  - NIFTY
+
+costs:
+  slippage_per_side: 2.0
+  brokerage_per_trade: 20.0
+
+risk:
+  mode: fixed_lot
+  lot_size:
+    NIFTY: 25
+    BANKNIFTY: 15
+
+risk_engine:
+  daily_loss_cap: -3000
+  per_strategy_loss_cap: -1500
+  max_open_positions: 1
+  max_trades_per_session: 2
+  cooldown_after_losses: 2
+  strategy_kill_switch:
+    consecutive_losses: 4
+
+# ── Option-chain feed (synthetic for paper; swap to recorded/broker for live) ──
+option_chain_feed:
+  type: synthetic
+  synthetic:
+    atm_iv: 0.15
+    skew: -0.02
+    smile: 0.30
+    risk_free_rate: 0.07
+    strike_interval:
+      NIFTY: 50
+      BANKNIFTY: 100
+    num_strikes_each_side: 20
+    spread_pct: 0.01
+    min_spread: 0.5
+
+# ── Options config (read by OptionSelector + OptionsTranslationLayer) ─────────
+options:
+  enabled: true
+  structures_enabled:
+    long_option: true
+    debit_spread: false       # Phase 2, gated on 20-session review
+    credit_spread: false      # Phase 3
+    iron_fly: false           # Research only until 10-12 expiry cycles
+  expiry_policy: nearest_weekly_excluding_expiry_day
+  strike_policy: atm_or_one_itm
+  strike_interval:
+    NIFTY: 50
+    BANKNIFTY: 100
+  min_premium: 20
+  max_premium: 250
+  max_spread_pct: 0.03
+  max_quote_age_seconds: 5
+  allow_expiry_day_trades: false
+
+# ── Long option exit parameters ───────────────────────────────────────────────
+long_option:
+  premium_stop_pct: 0.30      # exit if premium drops 30% from entry
+  premium_target_pct: 0.50    # exit if premium rises 50% from entry
+  max_hold_minutes: 60
+  no_new_entry_after: "14:30"
+  force_flat_after: "15:10"
+  risk_per_trade_pct: 0.003   # 0.30% of capital per trade
+
+# ── Debit spread (disabled Phase 1) ──────────────────────────────────────────
+debit_spread:
+  enabled: false
+  short_leg_distance_strikes: 2
+  max_debit_per_lot: 2500
+  stop_loss_pct_of_debit: 0.45
+  target_pct_of_max_value: 0.60
+
+# ── Active strategies ─────────────────────────────────────────────────────────
+strategies:
+  vwap_pullback:
+    enabled: true
+    convert_to_options: true   # Signal → OptionIntent → NIFTY CE/PE
+    no_entry_after: "14:30"
+    max_trades_per_day: 1
+    target_r: 2.0
+    min_trend_bars: 3
+    pullback_zone_pct: 0.003
+
+  vwap_reversion:
+    enabled: true
+    convert_to_options: true
+    stretch_threshold_atr: 1.5
+    min_bars_stretched: 2
+    min_reversal_ratio: 0.25
+    max_stretch_bars: 30
+    no_entry_after: "14:30"
+    max_trades_per_day: 1
+    stop_mode: hybrid_atr
+    atr_stop_multiplier: 0.75
+    stop_buffer_pct: 0.0008
+
+  or_failure_fade:
+    enabled: false            # research only in Phase 1
+
+  compression_breakout:
+    enabled: false            # research only until CB edge validated
+
+  orb:
+    enabled: false
+
+  iron_fly:
+    enabled: false            # disabled until 10-12 expiry cycles archived
+
+multi_leg_simulator:
+  mode: realistic

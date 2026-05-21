@@ -269,6 +269,14 @@ class BarEngine:
         state.open_multi_leg_trades = still_open
 
     def _size_multi_leg(self, signal: MultiLegSignal) -> int:
+        from src.core.option_intent import STRUCTURE_LONG_OPTION, STRUCTURE_DEBIT_SPREAD
+        # Long-option / debit-spread: Phase 1 always uses 1 lot.
+        # Risk-budget sizing comes in Phase 2 once premium stop-loss is wired.
+        if signal.structure_type in (STRUCTURE_LONG_OPTION, STRUCTURE_DEBIT_SPREAD):
+            max_lots = self.config.get('risk_engine', {}).get('max_lots_per_trade', 1)
+            return max(1, min(max_lots, 1))
+
+        # Iron Fly and other credit structures: size by max-loss budget
         cfg = self.config.get('strategies', {}).get('iron_fly', {})
         capital = cfg.get('capital', 1000000)
         risk_pct = cfg.get('risk_per_trade_pct', 0.005)

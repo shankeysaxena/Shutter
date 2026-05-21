@@ -480,3 +480,112 @@ def wrap_strategies(
     detector = MarketStateDetector()
     policy   = StrategyEligibilityPolicy.from_name(policy_name)
     return [AllocationGatedStrategy(s, detector, policy) for s in strategies]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Options conversion gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OptionsConversionGate(BaseStrategy):
+    """
+    Wraps any strategy (typically already AllocationGated) and converts its
+    Signal into a MultiLegSignal via the OptionsTranslationLayer when:
+
+      1. ctx.chain_snapshot is available (live chain feed connected), AND
+      2. the strategy's config has convert_to_options: true
+
+    Falls back silently to the original Signal if the chain is missing or
+    translation fails — so the index-signal live-paper path continues working
+    without a chain feed attached.
+    """
+
+    def __init__(self, strategy: BaseStrategy, config: dict):
+        from src.execution.options_translation import OptionsTranslationLayer
+        self._strategy    = strategy
+        self._config      = config
+        self._translator  = OptionsTranslationLayer()
+        self.name         = strategy.name
+
+    def generate_signal(self, ctx):
+        signal = self._strategy.generate_signal(ctx)
+        if signal is None:
+            return None
+
+        # Only attempt conversion for single-leg signals when chain is present
+        from src.core.models import Signal
+        if not isinstance(signal, Signal):
+            return signal  # already a MultiLegSignal; pass through
+
+        strat_cfg = (self._config.get('strategies') or {}).get(self.name.lower(), {})
+        if not strat_cfg.get('convert_to_options', False):
+            return signal
+
+        chain = getattr(ctx, 'chain_snapshot', None)
+        if chain is None:
+            return signal  # graceful degradation — no chain feed
+
+        intent = self._signal_to_intent(signal, ctx)
+        if intent is None:
+            return signal
+
+        multi_leg = self._translator.translate(intent, chain, self._config)
+        return multi_leg if multi_leg is not None else signal
+
+    def _signal_to_intent(self, signal, ctx):
+        from src.core.option_intent import (
+            OptionIntent, DIRECTION_BULLISH, DIRECTION_BEARISH, STRUCTURE_LONG_OPTION
+        )
+        direction = (
+            DIRECTION_BULLISH if signal.direction == 'LONG' else
+            DIRECTION_BEARISH if signal.direction == 'SHORT' else None
+        )
+        if direction is None:
+            return None
+
+        long_cfg = self._config.get('long_option', {})
+        return OptionIntent(
+            strategy_name=signal.strategy_name,
+            instrument=signal.instrument,
+            timestamp=signal.timestamp,
+            direction=direction,
+            preferred_structure=STRUCTURE_LONG_OPTION,
+            underlying_entry=signal.metadata.get('entry_price', ctx.bar_event.candle.close),
+            underlying_stop=signal.stop_price if signal.stop_price else None,
+            underlying_target=signal.target_price if signal.target_price else None,
+            max_hold_minutes=long_cfg.get('max_hold_minutes', 60),
+            metadata={**signal.metadata, 'regime': getattr(ctx.market_state, 'regime', None)},
+        )
+
+    def explain_no_signal(self, ctx):
+        return self._strategy.explain_no_signal(ctx)
+
+    def near_miss_metrics(self, ctx):
+        return self._strategy.near_miss_metrics(ctx)
+
+    def evaluate_multi_leg_exits(self, ctx):
+        return self._strategy.evaluate_multi_leg_exits(ctx)
+
+    def reset(self) -> None:
+        self._strategy.reset()
+
+
+def wrap_strategies_with_options(
+    strategies: list,
+    policy_name: str,
+    config: dict,
+) -> list:
+    """
+    Like wrap_strategies but adds OptionsConversionGate on top when any
+    strategy has convert_to_options: true in config.
+    """
+    detector = MarketStateDetector()
+    policy   = StrategyEligibilityPolicy.from_name(policy_name)
+    wrapped  = []
+    strats_cfg = config.get('strategies', {})
+    for s in strategies:
+        gated = AllocationGatedStrategy(s, detector, policy)
+        if strats_cfg.get(s.name.lower(), {}).get('convert_to_options', False):
+            wrapped.append(OptionsConversionGate(gated, config))
+        else:
+            wrapped.append(gated)
+    return wrapped

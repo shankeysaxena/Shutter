@@ -104,51 +104,63 @@ class TestCompressionBreakout:
         st2 = s._state('NIFTY', _DATE)
         assert st2.phase == 'IDLE'
 
-    def test_transitions_to_compressed(self):
-        """5 narrow bars (H-L=2pts) around VWAP → COMPRESSED state."""
+    def test_transitions_to_watching_when_market_state_compressed(self):
+        """When allocator injects compression_detected=True, strategy transitions to WATCHING."""
+        from src.strategies.allocator import SessionState
         s = CompressionBreakoutStrategy()
         cfg = _cfg()
-        # Tight bars: high=close+1, low=close-1 → window range = 22001-21999 = 2pts
-        # 2pts / ATR 15 = 0.13 < max_range_atr_ratio 0.4 → compressed
-        for i in range(5):
-            be, st = _bar(f'10:0{i}', 22000,
-                           high=22001, low=21999,
-                           sh=22001, sl=21999, atr=15.0, vwap_dist=0.0)
-            ctx = StrategyContext(be, st, cfg)
-            s.generate_signal(ctx)
+        ms = SessionState(
+            date=_DATE, instrument='NIFTY', regime=REGIME_NEUTRAL,
+            or_width_pct=0.003, gap_abs_pct=0.0,
+            prior_day_range_pct=0.01, is_wide_or=False, is_large_gap=False,
+            compression_detected=True, comp_high=22001.0, comp_low=21999.0,
+        )
+        be, st = _bar('10:30', 22000, atr=15.0)
+        ctx = StrategyContext(be, st, cfg, market_state=ms)
+        s.generate_signal(ctx)
         state = s._state('NIFTY', _DATE)
-        assert state.phase == 'COMPRESSED'
+        assert state.phase == 'WATCHING'
 
     def test_long_signal_on_upside_breakout(self):
-        """After compression (window range=2pts), bar closes above comp_high → LONG."""
+        """Allocator-provided comp_high=22030, comp_low=21990; bar closes just above → LONG."""
+        from src.strategies.allocator import SessionState
         s = CompressionBreakoutStrategy()
         cfg = _cfg()
-        for i in range(5):
-            be, st = _bar(f'10:0{i}', 22000,
-                           high=22001, low=21999,
-                           sh=22001, sl=21999, atr=15.0, vwap_dist=0.0)
-            s.generate_signal(StrategyContext(be, st, cfg))
-        # comp_high ≈ 22001; breakout bar closes above it
-        be_b, st_b = _bar('10:05', 22020, high=22025, low=22000,
-                            sh=22025, sl=21999, atr=15.0)
-        sig = s.generate_signal(StrategyContext(be_b, st_b, cfg))
+        # comp_range = 40pts; max_overshoot = 40 * 0.5 = 20pts
+        # breakout close = 22038 (8pts above comp_high, within 20pt cap)
+        ms = SessionState(
+            date=_DATE, instrument='NIFTY', regime=REGIME_NEUTRAL,
+            or_width_pct=0.003, gap_abs_pct=0.0,
+            prior_day_range_pct=0.01, is_wide_or=False, is_large_gap=False,
+            compression_detected=True, comp_high=22030.0, comp_low=21990.0,
+        )
+        # First bar: enter WATCHING state (close=22010, inside range → no signal)
+        be, st = _bar('10:30', 22010, atr=15.0)
+        s.generate_signal(StrategyContext(be, st, cfg, market_state=ms))
+        # Breakout bar: close just above comp_high, within overshoot cap
+        be_b, st_b = _bar('10:31', 22038, high=22042, low=22028, atr=15.0)
+        sig = s.generate_signal(StrategyContext(be_b, st_b, cfg, market_state=ms))
         assert sig is not None
         assert sig.direction == 'LONG'
-        assert sig.stop_price < 21999   # below comp_low
-        assert sig.target_price > 22020
+        assert sig.stop_price < 22038   # ATR-based stop below entry
+        assert sig.target_price > 22038
 
     def test_short_signal_on_downside_breakout(self):
+        """Allocator-provided comp_low=21990; bar closes just below → SHORT."""
+        from src.strategies.allocator import SessionState
         s = CompressionBreakoutStrategy()
         cfg = _cfg()
-        for i in range(5):
-            be, st = _bar(f'10:0{i}', 22000,
-                           high=22001, low=21999,
-                           sh=22001, sl=21999, atr=15.0, vwap_dist=0.0)
-            s.generate_signal(StrategyContext(be, st, cfg))
-        # comp_low ≈ 21999; breakout bar closes below it
-        be_b, st_b = _bar('10:05', 21980, high=21999, low=21975,
-                            sh=22001, sl=21975, atr=15.0)
-        sig = s.generate_signal(StrategyContext(be_b, st_b, cfg))
+        ms = SessionState(
+            date=_DATE, instrument='NIFTY', regime=REGIME_NEUTRAL,
+            or_width_pct=0.003, gap_abs_pct=0.0,
+            prior_day_range_pct=0.01, is_wide_or=False, is_large_gap=False,
+            compression_detected=True, comp_high=22030.0, comp_low=21990.0,
+        )
+        be, st = _bar('10:30', 22010, atr=15.0)
+        s.generate_signal(StrategyContext(be, st, cfg, market_state=ms))
+        # Breakout bar: close just below comp_low, within overshoot cap
+        be_b, st_b = _bar('10:31', 21982, high=21990, low=21978, atr=15.0)
+        sig = s.generate_signal(StrategyContext(be_b, st_b, cfg, market_state=ms))
         assert sig is not None
         assert sig.direction == 'SHORT'
 
