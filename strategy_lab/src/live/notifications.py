@@ -85,17 +85,50 @@ class NotificationService:
             import requests
             emoji = _EMOJI.get(level, '')
             ts    = datetime.now().strftime('%H:%M:%S')
-            text  = f"{emoji} *[{level}]* `{self._session}` `{ts}`\n{message}"
+            text  = f"{emoji} <b>[{level}]</b> <code>{self._session}</code> <code>{ts}</code>\n{_md_to_html(message)}"
             url   = f"https://api.telegram.org/bot{self._token}/sendMessage"
             resp  = requests.post(url, json={
                 'chat_id':    self._chat_id,
                 'text':       text,
-                'parse_mode': 'Markdown',
+                'parse_mode': 'HTML',
             }, timeout=5)
             if not resp.ok:
                 logger.warning(f"Telegram send failed: {resp.status_code} {resp.text[:100]}")
         except Exception as e:
             logger.warning(f"Telegram notification error (non-fatal): {e}")
+
+
+# ─── Markdown → HTML converter ───────────────────────────────────────────────
+
+def _md_to_html(text: str) -> str:
+    """
+    Convert the simple Markdown subset used in notification messages to HTML.
+
+    Handles:
+      *bold*         → <b>bold</b>
+      `code`         → <code>code</code>
+      plain text     → HTML-escaped (& < > safe; underscores are literal)
+
+    Backtick code spans are processed first so their content is protected
+    from bold conversion and HTML escaping of special chars doesn't apply
+    a second time.
+    """
+    import html as _html
+    import re as _re
+
+    # Split on backtick spans; odd-indexed parts are inside code spans
+    parts = text.split('`')
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            # Inside code span — HTML-escape content, wrap in <code>
+            out.append(f'<code>{_html.escape(part)}</code>')
+        else:
+            # Outside code span — HTML-escape, then convert *bold*
+            escaped = _html.escape(part)
+            bolded  = _re.sub(r'\*(.+?)\*', r'<b>\1</b>', escaped, flags=_re.DOTALL)
+            out.append(bolded)
+    return ''.join(out)
 
 
 # ─── Convenience builders ─────────────────────────────────────────────────────
