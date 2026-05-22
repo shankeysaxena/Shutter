@@ -551,6 +551,11 @@ class LivePaperRuntime:
     def is_running(self) -> bool:
         return self._running
 
+    @property
+    def eod_complete(self) -> bool:
+        """True once EOD flush has fired and session summary has been sent."""
+        return self._eod_flushed and self._auto_shutdown
+
     def get_risk_state(self) -> RiskState:
         return self._risk_state
 

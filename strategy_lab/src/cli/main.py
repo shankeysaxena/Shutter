@@ -391,7 +391,7 @@ def _cmd_live_paper_start(args) -> int:
 
     import time
     from datetime import datetime, time as time_
-    _AUTO_SHUTDOWN_AT = time_(15, 35)
+    _AUTO_SHUTDOWN_AT = time_(15, 31)   # hard fallback if last bar never arrives
 
     from datetime import timedelta
     _MARKET_OPEN   = time_(9, 15)
@@ -405,9 +405,14 @@ def _cmd_live_paper_start(args) -> int:
         time.sleep(1)
         now = datetime.now()
 
-        # Wall-clock auto-shutdown at 15:35
+        # Shutdown as soon as EOD flush is done (last bar processed + summary sent)
+        if runtime.eod_complete:
+            print("\nEOD flush complete — session closing.")
+            break
+
+        # Hard wall-clock fallback at 15:31 (handles missing last bar)
         if now.time() >= _AUTO_SHUTDOWN_AT and not runtime._auto_shutdown:
-            print("\n15:35 reached — auto shutdown...")
+            print("\n15:31 reached — auto shutdown...")
             runtime.trigger_eod_shutdown()
             break
 
