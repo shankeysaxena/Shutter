@@ -518,18 +518,22 @@ class OptionsConversionGate(BaseStrategy):
 
         strat_cfg = (self._config.get('strategies') or {}).get(self.name.lower(), {})
         if not strat_cfg.get('convert_to_options', False):
-            return signal
+            return signal   # options mode not requested — pass index signal through
 
+        # convert_to_options: true — strict mode.
+        # If translation fails for any reason (no chain, bad quote, selector reject),
+        # return None rather than silently placing an index paper trade.
+        # Mixed-mode confusion (some trades as options, some as index) is worse than
+        # missing a trade.
         chain = getattr(ctx, 'chain_snapshot', None)
         if chain is None:
-            return signal  # graceful degradation — no chain feed
+            return None
 
         intent = self._signal_to_intent(signal, ctx)
         if intent is None:
-            return signal
+            return None
 
-        multi_leg = self._translator.translate(intent, chain, self._config)
-        return multi_leg if multi_leg is not None else signal
+        return self._translator.translate(intent, chain, self._config)  # None on failure → skip
 
     def _signal_to_intent(self, signal, ctx):
         from src.core.option_intent import (

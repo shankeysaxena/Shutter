@@ -267,11 +267,22 @@ def _cmd_live_paper_start(args) -> int:
 
     # Build strategies + allocator
     from src.backtest.experiment import _build_strategies
-    from src.strategies.allocator import wrap_strategies
+    from src.strategies.allocator import wrap_strategies, wrap_strategies_with_options
 
     policy = args.policy or 'deterministic_no_orb'
     base_strategies = _build_strategies(config)
-    strategies = wrap_strategies(base_strategies, policy)
+
+    # Use options conversion gate when any strategy has convert_to_options: true
+    options_enabled = config.get('options', {}).get('enabled', False)
+    has_convert = any(
+        v.get('convert_to_options', False)
+        for v in config.get('strategies', {}).values()
+        if isinstance(v, dict)
+    )
+    if options_enabled and has_convert:
+        strategies = wrap_strategies_with_options(base_strategies, policy, config)
+    else:
+        strategies = wrap_strategies(base_strategies, policy)
 
     # Build live components
     from src.execution.paper_executor import PaperExecutor
@@ -330,6 +341,14 @@ def _cmd_live_paper_start(args) -> int:
         print(f"  Shadow config:     {shadow_cfg_label}")
         print(f"  (observation only — simulated P&L, no orders placed by shadows)")
 
+    # Build option chain feed when options mode is active
+    option_chain_feed = None
+    if options_enabled and has_convert:
+        from src.backtest.experiment import _build_chain_feed
+        option_chain_feed = _build_chain_feed(config)
+        if option_chain_feed is not None:
+            print(f"  Option chain feed: {option_chain_feed.data_origin}")
+
     runtime = LivePaperRuntime(
         strategies=strategies,
         executor=executor,
@@ -341,6 +360,7 @@ def _cmd_live_paper_start(args) -> int:
         monitor=monitor,
         shadow_evaluators=shadow_evaluators,
         notifier=notifier,
+        option_chain_feed=option_chain_feed,
     )
     monitor.start_background_check(interval_seconds=30)
 
