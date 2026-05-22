@@ -16,6 +16,7 @@ runtime:
 
 instruments:
   - NIFTY
+  - BANKNIFTY
 
 costs:
   slippage_per_side: 2.0
@@ -28,10 +29,13 @@ risk:
     BANKNIFTY: 15
 
 risk_engine:
-  daily_loss_cap: -3000
-  per_strategy_loss_cap: -1500
-  max_open_positions: 1
-  max_trades_per_session: 2
+  daily_loss_cap: -6000           # 2 instruments × -3000 each
+  per_strategy_loss_cap: -3000
+  max_open_positions: 2           # 1 per instrument
+  max_trades_per_session: 4       # 2 per instrument
+  max_open_option_positions: 2    # 1 per instrument
+  max_option_trades_per_session: 4
+  max_daily_option_loss: -6000
   cooldown_after_losses: 2
   strategy_kill_switch:
     consecutive_losses: 4
@@ -65,7 +69,7 @@ options:
     NIFTY: 50
     BANKNIFTY: 100
   min_premium: 20
-  max_premium: 250
+  max_premium: 600               # BANKNIFTY ATM options can be 300-500
   max_spread_pct: 0.03
   max_quote_age_seconds: 5
   allow_expiry_day_trades: false
