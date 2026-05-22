@@ -29,11 +29,11 @@ risk:
     BANKNIFTY: 15
 
 risk_engine:
-  daily_loss_cap: -6000           # 2 instruments × -3000 each
+  daily_loss_cap: -8000           # 2 instruments × index + options combined
   per_strategy_loss_cap: -3000
-  max_open_positions: 2           # 1 per instrument
-  max_trades_per_session: 4       # 2 per instrument
-  max_open_option_positions: 2    # 1 per instrument
+  max_open_positions: 4           # up to 2 per instrument (index + options)
+  max_trades_per_session: 8       # up to 4 per instrument
+  max_open_option_positions: 2    # 1 option position per instrument
   max_option_trades_per_session: 4
   max_daily_option_loss: -6000
   cooldown_after_losses: 2
@@ -116,10 +116,29 @@ strategies:
     stop_buffer_pct: 0.0008
 
   or_failure_fade:
-    enabled: false            # research only in Phase 1
+    enabled: true
+    convert_to_options: false   # index paper trade — validated edge, keep as-is
+    max_failure_bars: 5
+    stop_buffer_pct: 0.0003
+    target_type: vwap
+    no_entry_after: "13:30"
+    max_trades_per_day: 1
+    stop_mode: hybrid_atr
+    atr_stop_multiplier: 0.75
+    min_gap_pct: 0.005
+    min_or_width_pct: 0.000
+    require_vwap_reclaim: true
 
   compression_breakout:
-    enabled: false            # research only until CB edge validated
+    enabled: true
+    convert_to_options: false   # index paper trade — monitoring CB edge in live conditions
+    entry_start: "10:00"
+    no_entry_after: "15:00"
+    max_overshoot_ratio: 0.5
+    atr_stop_multiplier: 1.0
+    atr_target_multiplier: 2.0
+    min_atr: 12.0
+    max_trades_per_day: 1
 
   orb:
     enabled: false
