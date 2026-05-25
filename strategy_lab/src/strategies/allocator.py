@@ -505,6 +505,16 @@ class OptionsConversionGate(BaseStrategy):
         self._config      = config
         self._translator  = OptionsTranslationLayer()
         self.name         = strategy.name
+        # Rejection tracking — read by heartbeat and Telegram callback
+        self._last_rejection: Optional[dict] = None   # {time, instrument, reason}
+        self._on_rejection = None   # callable(name, instrument, reason, ts) — set by runtime
+
+    def set_rejection_callback(self, fn) -> None:
+        """Wire up a callback for immediate Telegram notification on option drop."""
+        self._on_rejection = fn
+
+    def get_last_rejection(self) -> Optional[dict]:
+        return self._last_rejection
 
     def generate_signal(self, ctx):
         signal = self._strategy.generate_signal(ctx)
@@ -521,19 +531,42 @@ class OptionsConversionGate(BaseStrategy):
             return signal   # options mode not requested — pass index signal through
 
         # convert_to_options: true — strict mode.
-        # If translation fails for any reason (no chain, bad quote, selector reject),
-        # return None rather than silently placing an index paper trade.
-        # Mixed-mode confusion (some trades as options, some as index) is worse than
-        # missing a trade.
+        # All failures are logged and surfaced via callback so they're visible on Telegram.
+        bar  = ctx.bar_event.candle
         chain = getattr(ctx, 'chain_snapshot', None)
         if chain is None:
+            self._record_rejection('no_chain_snapshot', bar)
             return None
 
         intent = self._signal_to_intent(signal, ctx)
         if intent is None:
+            self._record_rejection('signal_to_intent_failed', bar)
             return None
 
-        return self._translator.translate(intent, chain, self._config)  # None on failure → skip
+        multi_leg = self._translator.translate(intent, chain, self._config)
+        if multi_leg is None:
+            reason = self._translator.last_rejection_reason or 'translation_failed'
+            self._record_rejection(reason, bar)
+            return None
+
+        return multi_leg
+
+    def _record_rejection(self, reason: str, bar) -> None:
+        """Log, store, and optionally fire Telegram callback on option conversion failure."""
+        self._last_rejection = {
+            'time':       bar.timestamp,
+            'instrument': bar.instrument,
+            'reason':     reason,
+        }
+        logger.warning(
+            f"Option conversion dropped: {self.name} {bar.instrument} "
+            f"@ {bar.timestamp.strftime('%H:%M')} reason={reason}"
+        )
+        if self._on_rejection:
+            try:
+                self._on_rejection(self.name, bar.instrument, reason, bar.timestamp)
+            except Exception:
+                pass
 
     def _signal_to_intent(self, signal, ctx):
         from src.core.option_intent import (

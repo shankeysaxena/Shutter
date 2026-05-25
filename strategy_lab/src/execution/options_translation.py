@@ -29,6 +29,7 @@ class OptionsTranslationLayer:
 
     def __init__(self, selector: Optional[OptionSelector] = None):
         self._selector = selector or OptionSelector()
+        self.last_rejection_reason: Optional[str] = None  # set when translate() returns None
 
     def translate(
         self,
@@ -48,19 +49,23 @@ class OptionsTranslationLayer:
         structures  = options_cfg.get('structures_enabled', {})
         selector_cfg = {**options_cfg}  # OptionSelector reads from same dict
 
+        self.last_rejection_reason = None
         structure = intent.preferred_structure
 
         if structure == STRUCTURE_LONG_OPTION:
             if not structures.get('long_option', True):
+                self.last_rejection_reason = 'long_option_disabled'
                 return None
             return self._build_long_option(intent, chain, selector_cfg)
 
         if structure == STRUCTURE_DEBIT_SPREAD:
             if not structures.get('debit_spread', False):
+                self.last_rejection_reason = 'debit_spread_disabled'
                 return None
             return self._build_debit_spread(intent, chain, selector_cfg, config)
 
-        return None  # unknown structure
+        self.last_rejection_reason = f'unknown_structure:{structure}'
+        return None
 
     # ------------------------------------------------------------------
 
@@ -73,7 +78,8 @@ class OptionsTranslationLayer:
         try:
             leg = self._selector.select(intent, chain, selector_cfg)
         except SelectionRejected as exc:
-            return None  # caller can log if needed; None = skip this bar
+            self.last_rejection_reason = str(exc)
+            return None
 
         return MultiLegSignal(
             strategy_name=intent.strategy_name,

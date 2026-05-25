@@ -134,6 +134,12 @@ class LivePaperRuntime:
             IntradayATRFeature(period=14),
         ]
 
+        # Wire rejection callback on any OptionsConversionGate in the stack
+        from src.strategies.allocator import OptionsConversionGate as _OCG
+        for _s in strategies:
+            if isinstance(_s, _OCG):
+                _s.set_rejection_callback(self._on_option_rejection)
+
         # Phase 3 — option chain feed + executor
         self._option_chain_feed = option_chain_feed
         if option_chain_feed is not None:
@@ -484,6 +490,14 @@ class LivePaperRuntime:
 
             self._notify_option_entry(signal, trade)
 
+    def _on_option_rejection(self, strategy_name: str, instrument: str, reason: str, ts) -> None:
+        """Fired immediately when an option conversion drops a base signal. Goes to Telegram."""
+        self.notifier.send(
+            f"*Option Signal Dropped* `{strategy_name}` on `{instrument}`\n"
+            f"Time: {ts.strftime('%H:%M')}  Reason: `{reason}`",
+            WARNING,
+        )
+
     def _notify_option_entry(self, signal: MultiLegSignal, trade: MultiLegTrade) -> None:
         leg   = trade.entry_fills[0].leg if trade.entry_fills else None
         prem  = abs(trade.net_entry_credit)
@@ -605,9 +619,13 @@ class LivePaperRuntime:
         except Exception:
             pass
 
+        from src.strategies.allocator import OptionsConversionGate as _OCG
         for s in self.strategies:
+            is_options_gate = isinstance(s, _OCG)
             inner = getattr(s, '_strategy', s)
-            name  = inner.name if hasattr(inner, 'name') else s.name
+            # drill through AllocationGatedStrategy wrapper to reach base strategy
+            inner = getattr(inner, '_strategy', inner)
+            name  = s.name
             if ctx_temp:
                 try:
                     reason  = inner.explain_no_signal(ctx_temp)
@@ -621,7 +639,15 @@ class LivePaperRuntime:
                     elif 'gap_abs_pct' in metrics:
                         bar_str = f" gap {metrics['gap_abs_pct']}%/{metrics['min_gap_pct']}%"
                     pct_str = f" ({pct}%)" if pct is not None else ''
-                    strategy_str += f"\n`{name}`: {reason}{bar_str}{pct_str}"
+                    # Show option conversion rejection if base signal was ready but dropped
+                    opt_str = ''
+                    if is_options_gate:
+                        rej = s.get_last_rejection()
+                        if rej:
+                            opt_str = f" → ❌OPT:{rej['reason']}@{rej['time'].strftime('%H:%M')}"
+                        else:
+                            opt_str = ' [opt]'
+                    strategy_str += f"\n`{name}`: {reason}{bar_str}{pct_str}{opt_str}"
                 except Exception:
                     strategy_str += f"\n`{name}`: —"
 
