@@ -565,6 +565,103 @@ class LivePaperRuntime:
     def is_running(self) -> bool:
         return self._running
 
+    def backfill_missed_bars(
+        self,
+        from_dt:    datetime,
+        to_dt:      datetime,
+        kite_client,
+    ) -> None:
+        """
+        Fetch and replay 1-min bars from Kite API for the gap window
+        [from_dt, to_dt]. Called immediately after a successful reconnect.
+
+        Each missed bar is replayed through the full _process_bar pipeline
+        (features, strategy signals, exit checks) so the session state stays
+        consistent — the engine never sees the gap.
+
+        Safety limits:
+          - Ignores bars before 09:15 (pre-market)
+          - Ignores bars after 15:29 (post-close)
+          - No-ops if gap is 0 or negative
+        """
+        from datetime import timedelta
+        from src.integrations.zerodha.instruments import resolve_instrument_token
+        from src.live.bar_builder import LiveBar
+
+        if from_dt >= to_dt:
+            return
+
+        gap_mins = (to_dt - from_dt).total_seconds() / 60
+        logger.info(
+            f"Backfilling {gap_mins:.0f} min gap "
+            f"({from_dt.strftime('%H:%M')} → {to_dt.strftime('%H:%M')}) "
+            f"for {self.instruments}"
+        )
+        self.notifier.send(
+            f"*Backfilling* {gap_mins:.0f}-min gap "
+            f"({from_dt.strftime('%H:%M')}–{to_dt.strftime('%H:%M')})\n"
+            f"Fetching missed bars from Kite API…",
+            INFO,
+        )
+
+        total_replayed = 0
+        for instrument in self.instruments:
+            try:
+                token = resolve_instrument_token(instrument, 'NSE')
+                raw   = kite_client.historical_data(
+                    instrument_token=token,
+                    from_date=from_dt,
+                    to_date=to_dt,
+                    interval='minute',
+                    continuous=False,
+                    oi=False,
+                )
+            except Exception as e:
+                logger.warning(f"Backfill fetch failed for {instrument}: {e}")
+                continue
+
+            # Filter to valid market window and sort ascending
+            market_open  = time(9, 15)
+            market_close = time(15, 29)
+            bars = []
+            for c in raw:
+                ts = c.get('date')
+                if hasattr(ts, 'tzinfo') and ts.tzinfo:
+                    ts = ts.replace(tzinfo=None)
+                if ts and market_open <= ts.time() <= market_close:
+                    bars.append(LiveBar(
+                        instrument=instrument,
+                        timestamp=ts,
+                        open=float(c['open']),
+                        high=float(c['high']),
+                        low=float(c['low']),
+                        close=float(c['close']),
+                        volume=int(c.get('volume', 0)),
+                        tick_count=0,
+                        is_complete=True,
+                    ))
+            bars.sort(key=lambda b: b.timestamp)
+
+            for bar in bars:
+                # Keep executor price current so paper fills are realistic
+                if isinstance(self.executor, PaperExecutor):
+                    self.executor.update_market_price(instrument, bar.close)
+                self._process_bar(bar)
+                total_replayed += 1
+
+            if bars:
+                logger.info(
+                    f"Backfilled {len(bars)} bars for {instrument} "
+                    f"({bars[0].timestamp.strftime('%H:%M')}–"
+                    f"{bars[-1].timestamp.strftime('%H:%M')})"
+                )
+
+        self.notifier.send(
+            f"*Backfill complete* — {total_replayed} bars replayed across "
+            f"{self.instruments}",
+            INFO,
+        )
+
     @property
     def eod_complete(self) -> bool:
         """True once EOD flush has fired and session summary has been sent."""

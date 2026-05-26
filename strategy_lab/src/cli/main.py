@@ -443,6 +443,7 @@ def _cmd_live_paper_start(args) -> int:
                 print(f"\n[WARNING] {msg}")
                 notifier.send(msg, 'WARNING')
                 try:
+                    gap_from = runtime._last_bar_time
                     feed.reconnect()
                     monitor.on_connect()
                     _reconnect_count[0] = 0   # success — reset counter
@@ -450,6 +451,14 @@ def _cmd_live_paper_start(args) -> int:
                     notifier.send(
                         f"✅ Feed reconnected (attempt {retry_n}). Resuming.", 'INFO'
                     )
+                    # Backfill bars missed during the gap
+                    if gap_from is not None:
+                        gap_from_dt = (gap_from.replace(tzinfo=None)
+                                       if gap_from.tzinfo else gap_from)
+                        gap_to_dt   = datetime.now().replace(second=0, microsecond=0)
+                        from datetime import timedelta
+                        gap_from_dt = gap_from_dt + timedelta(minutes=1)
+                        runtime.backfill_missed_bars(gap_from_dt, gap_to_dt, kite_client)
                 except Exception as e:
                     print(f"[WARNING] Reconnect attempt {retry_n} failed: {e}. "
                           f"Retrying in {delay_s}s...")
